@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: vision-agua-backend
+    env: node
+    region: oregon
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: MP_TOKEN
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT
+        sync: false
