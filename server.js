@@ -1,25 +1,12 @@
 /**
  * Vision Água — Backend de Recarga
- * Versão 2.1 — Cashback + Níveis + VIP + Promoções + Voz IA (Edge TTS)
- * 
- * Recursos:
- *   1. Cria PIX no Mercado Pago com external_reference "APP_CLI_{uid}"
- *   2. Recebe webhook quando o PIX é pago
- *   3. Calcula e credita: valor pago + cashback padrão + nível + VIP + promoção
- *   4. Registra tudo no Firebase pra o app e o dash mostrarem
- *   5. 🔊 Gera áudio com voz IA (Edge TTS) via /falar
- * 
- * Prioridade de cashback:
- *   1º VIP individual (se ativo no cliente)
- *   2º Nível automático (Bronze/Prata/Ouro)
- *   3º Padrão (fallback)
+ * Versão 2.2 — Cashback + Níveis + VIP + Promoções + Voz IA (Google TTS)
  */
 
 const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
 const fetch = require('node-fetch');
-const { MsEdgeTTS, OUTPUT_FORMAT } = require('msedge-tts');
 
 const app = express();
 app.use(cors());
@@ -53,54 +40,63 @@ app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'Vision Água Backend',
-    version: '2.1.0',
+    version: '2.2.0',
     features: ['pix', 'cashback', 'niveis', 'vip', 'promocoes', 'tts'],
     timestamp: new Date().toISOString()
   });
 });
 
 // =====================================================
-// 🔊 TTS — Voz IA via Edge TTS
+// 🔊 TTS — Voz via Google Translate (grátis, sem lib)
 // =====================================================
-async function gerarAudioTTS(texto, voz, res) {
-  const tts = new MsEdgeTTS();
-  await tts.setMetadata(voz, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
+async function gerarAudioTTS(texto, res) {
+  // Limita a 200 caracteres (limite do Google TTS)
+  const textoLimpo = String(texto).substring(0, 200);
+  
+  const url = `https://translate.google.com/translate_tts?ie=UTF-8&tl=pt-BR&client=tw-ob&q=${encodeURIComponent(textoLimpo)}`;
+
+  const response = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(`Google TTS retornou HTTP ${response.status}`);
+  }
 
   res.set('Content-Type', 'audio/mpeg');
   res.set('Cache-Control', 'no-cache');
-  res.set('Accept-Ranges', 'bytes');
-
-  const { audioStream } = tts.toStream(texto);
 
   return new Promise((resolve, reject) => {
-    audioStream.on('error', reject);
-    audioStream.on('end', resolve);
-    audioStream.pipe(res);
+    response.body.on('error', reject);
+    response.body.on('end', resolve);
+    response.body.pipe(res);
   });
 }
 
-// GET /falar?texto=Olá+João&voz=pt-BR-FranciscaNeural
+// GET /falar?texto=Olá+João
 app.get('/falar', async (req, res) => {
   try {
-    const texto = String(req.query.texto || '').trim().substring(0, 500);
+    const texto = String(req.query.texto || '').trim();
     if (!texto) return res.status(400).json({ erro: 'texto é obrigatório' });
 
-    const voz = String(req.query.voz || 'pt-BR-FranciscaNeural');
-    await gerarAudioTTS(texto, voz, res);
+    console.log(`🔊 TTS: "${texto.substring(0, 50)}..."`);
+    await gerarAudioTTS(texto, res);
   } catch (e) {
     console.error('❌ Erro /falar (GET):', e.message);
     if (!res.headersSent) res.status(500).json({ erro: e.message });
   }
 });
 
-// POST /falar  body: { "texto": "Olá João", "voz": "pt-BR-FranciscaNeural" }
+// POST /falar  body: { "texto": "Olá João" }
 app.post('/falar', async (req, res) => {
   try {
-    const texto = String(req.body?.texto || '').trim().substring(0, 500);
+    const texto = String(req.body?.texto || '').trim();
     if (!texto) return res.status(400).json({ erro: 'texto é obrigatório' });
 
-    const voz = String(req.body?.voz || 'pt-BR-FranciscaNeural');
-    await gerarAudioTTS(texto, voz, res);
+    console.log(`🔊 TTS: "${texto.substring(0, 50)}..."`);
+    await gerarAudioTTS(texto, res);
   } catch (e) {
     console.error('❌ Erro /falar (POST):', e.message);
     if (!res.headersSent) res.status(500).json({ erro: e.message });
@@ -109,7 +105,6 @@ app.post('/falar', async (req, res) => {
 
 // =====================================================
 // 💰 CÁLCULO DE CRÉDITOS
-// Soma: valor pago + cashback (padrão/nível/vip) + bônus promo
 // =====================================================
 async function calcularCreditos(uid, valorPago) {
   const resultado = {
@@ -127,17 +122,14 @@ async function calcularCreditos(uid, valorPago) {
   };
 
   try {
-    // ============ 1. CONFIG DE CASHBACK PADRÃO ============
     const configSnap = await db.ref('config/cashback_padrao').once('value');
     const config = configSnap.val() || {};
     const percentualPadrao = Number(config.valor) || 0;
 
-    // ============ 2. VERIFICA VIP DO CLIENTE ============
     const vipSnap = await db.ref(`clientes/${uid}/cashback_especial`).once('value');
     const vip = vipSnap.val() || {};
     const temVip = vip.ativo === true;
 
-    // ============ 3. VERIFICA NÍVEL AUTOMÁTICO ============
     let nivelAplicavel = null;
     if (!temVip) {
       try {
@@ -164,7 +156,6 @@ async function calcularCreditos(uid, valorPago) {
       }
     }
 
-    // ============ 4. DEFINE O PERCENTUAL EFETIVO ============
     let percentualEfetivo = percentualPadrao;
     let fonte = 'padrao';
 
@@ -178,7 +169,6 @@ async function calcularCreditos(uid, valorPago) {
       fonte = 'nivel';
     }
 
-    // ============ 5. CALCULA O CASHBACK ============
     if (config.ativo !== false && valorPago >= (config.valor_minimo || 0)) {
       let cbBase = valorPago * (percentualPadrao / 100);
       resultado.cashback_padrao = Number(cbBase.toFixed(2));
@@ -225,7 +215,6 @@ async function calcularCreditos(uid, valorPago) {
       }
     }
 
-    // ============ 6. PROMOÇÕES ============
     const promosSnap = await db.ref('promocoes').once('value');
     const promocoes = promosSnap.val() || {};
     const agora = Math.floor(Date.now() / 1000);
@@ -260,7 +249,6 @@ async function calcularCreditos(uid, valorPago) {
       resultado.detalhes.push({ tipo: 'promocao', valor: melhorBonus, id: melhorPromo.id, titulo: melhorPromo.titulo });
     }
 
-    // ============ 7. SOMA FINAL ============
     resultado.bonus_total = Number((
       resultado.cashback_padrao + 
       resultado.cashback_vip + 
@@ -372,7 +360,7 @@ app.post('/criar-pix', async (req, res) => {
 });
 
 // =====================================================
-// 🎯 PREVIEW — consulta quanto cliente recebe
+// 🎯 PREVIEW
 // =====================================================
 app.get('/preview/:uid/:valor', async (req, res) => {
   try {
@@ -402,7 +390,7 @@ app.get('/preview/:uid/:valor', async (req, res) => {
 });
 
 // =====================================================
-// 📥 WEBHOOK — recebe notificação do Mercado Pago
+// 📥 WEBHOOK
 // =====================================================
 app.post('/webhook', async (req, res) => {
   res.status(200).send('OK');
@@ -441,9 +429,7 @@ app.post('/webhook', async (req, res) => {
     const creditos = await calcularCreditos(uid, valor);
     const totalCreditar = creditos.total;
     
-    console.log(`💰 Pago: R$${valor.toFixed(2)} | CB Padrão: R$${creditos.cashback_padrao.toFixed(2)} | CB VIP: R$${creditos.cashback_vip.toFixed(2)} | CB Nível: R$${creditos.cashback_nivel.toFixed(2)} | Promo: R$${creditos.bonus_promo.toFixed(2)} | TOTAL: R$${totalCreditar.toFixed(2)}`);
-    if (creditos.promo_aplicada) console.log(`🎁 Promo: ${creditos.promo_aplicada.titulo}`);
-    if (creditos.nivel_aplicado) console.log(`⭐ Nível: ${creditos.nivel_aplicado}`);
+    console.log(`💰 Pago: R$${valor.toFixed(2)} | TOTAL: R$${totalCreditar.toFixed(2)}`);
 
     await db.ref(`clientes/${uid}`).transaction((cliente) => {
       if (!cliente) return cliente;
@@ -533,7 +519,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // =====================================================
-// 📊 CONSULTAR STATUS DE PAGAMENTO
+// 📊 CONSULTAR STATUS
 // =====================================================
 app.get('/status/:paymentId', async (req, res) => {
   try {
@@ -546,6 +532,6 @@ app.get('/status/:paymentId', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Vision Água Backend v2.1 rodando na porta ${PORT}`);
+  console.log(`🚀 Vision Água Backend v2.2 rodando na porta ${PORT}`);
   console.log(`📦 Recursos: PIX · Cashback · Níveis · VIP · Promoções · TTS`);
 });
